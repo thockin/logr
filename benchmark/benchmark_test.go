@@ -18,6 +18,7 @@ package logr
 
 import (
 	"fmt"
+	"os"
 	"testing"
 
 	"github.com/go-logr/logr"
@@ -272,4 +273,26 @@ func BenchmarkFuncrJSONLogInfoErrorValue(b *testing.B) {
 func BenchmarkFuncrJSONLogInfoMarshalerValue(b *testing.B) {
 	var log logr.Logger = funcr.NewJSON(noopJSON, funcr.Options{})
 	doMarshalerValue(b, log)
+}
+
+func BenchmarkFuncrFileAppend(b *testing.B) {
+	f, err := os.OpenFile("/tmp/o", os.O_WRONLY|os.O_APPEND, 0644)
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+	defer f.Close()
+	var log logr.Logger = funcr.NewJSON(funcr.LogToFileJSON(f), funcr.Options{})
+	doInfoOneArg(b, log)
+}
+
+func BenchmarkFuncrFileNotAppend(b *testing.B) {
+	f, err := os.OpenFile("/tmp/o", os.O_WRONLY, 0644)
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+	defer f.Close()
+	var log logr.Logger = funcr.NewJSON(funcr.LogToFileJSON(f), funcr.Options{})
+	doInfoOneArg(b, log)
 }

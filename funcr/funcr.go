@@ -38,26 +38,33 @@ import (
 	"bytes"
 	"encoding"
 	"fmt"
+	"io"
+	"os"
 	"path/filepath"
 	"reflect"
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
+	"syscall"
 	"time"
 
 	"github.com/go-logr/logr"
 )
 
 // New returns a logr.Logger which is implemented by an arbitrary function.
+// The provided function should be safe to call concurrently from multiple
+// goroutines.
 func New(fn func(prefix, args string), opts Options) logr.Logger {
 	return logr.New(newSink(fn, NewFormatter(opts)))
 }
 
 // NewJSON returns a logr.Logger which is implemented by an arbitrary function
-// and produces JSON output.
-func NewJSON(fn func(obj string), opts Options) logr.Logger {
-	fnWrapper := func(_, obj string) {
-		fn(obj)
+// and produces JSON output.  The provided function should be safe to call
+// concurrently from multiple goroutines.
+func NewJSON(fn func(str string), opts Options) logr.Logger {
+	fnWrapper := func(_, str string) {
+		fn(str)
 	}
 	return logr.New(newSink(fnWrapper, NewFormatterJSON(opts)))
 }
@@ -784,4 +791,110 @@ func (f *Formatter) AddValues(kvList []interface{}) {
 // the log line to a file and line.
 func (f *Formatter) AddCallDepth(depth int) {
 	f.depth += depth
+}
+
+//FIXME: move this to a different lib?
+//FIXME: equiv for non-JSON
+
+// LogToFileJSON returns a function, suitable for use in calls to NewJSON,
+// which writes log output to the provided os.File.  This output function takes
+// care to handle truncated files by seeking back to the truncated position,
+// when possible.
+func LogToFileJSON(f *os.File) func(string) {
+	fops := &fileOps{
+		seek: nullSeek,
+		size: nullSize,
+	}
+
+	// A simple function for when we don't need more.
+	trivialFunc := func(str string) { fmt.Fprintln(f, str) }
+
+	if app, err := isAppend(f); err != nil {
+		fmt.Fprintln(os.Stderr, "failed to detect if output is O_APPEND, disabling logfile truncation detection:", err)
+		return trivialFunc
+	} else if app {
+		return trivialFunc
+	}
+
+	// Test if this file supports Seek() (e.g. TTY output does not).
+	if _, err := f.Seek(0, io.SeekCurrent); err != nil {
+		return trivialFunc
+	}
+
+	// Do it the hard way.
+	fops.seek = fileSeek
+	fops.size = fileSize
+
+	return func(str string) {
+		fops.lock.Lock()
+		defer fops.lock.Unlock()
+		if err := seekIfNeeded(f, fops); err != nil {
+			fmt.Fprintln(os.Stderr, "disabling logfile truncation detection:", err)
+			fops.seek = nullSeek
+			fops.size = nullSize
+		}
+
+		b := []byte(str)
+		if b[len(b)-1] != '\n' {
+			b = append(b, '\n')
+		}
+		_, err := f.Write(b) // internally mutexed
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "error writing logfile:", err)
+		}
+	}
+}
+
+type fileOps struct {
+	lock sync.Mutex
+	seek func(f *os.File, pos int64, whence int) (int64, error)
+	size func(f *os.File) (int64, error)
+}
+
+func fileSeek(f *os.File, pos int64, whence int) (int64, error) {
+	return f.Seek(pos, whence)
+}
+
+func nullSeek(*os.File, int64, int) (int64, error) {
+	return 0, nil
+}
+
+func fileSize(f *os.File) (int64, error) {
+	st, err := f.Stat()
+	if err != nil {
+		return 0, err
+	}
+	return st.Size(), nil
+}
+
+func nullSize(*os.File) (int64, error) {
+	return 0, nil
+}
+
+func seekIfNeeded(f *os.File, fops *fileOps) error {
+	pos, err := fops.seek(f, 0, io.SeekCurrent)
+	if err != nil {
+		return fmt.Errorf("error reading logfile position: %w", err)
+	}
+
+	siz, err := fops.size(f)
+	if err != nil {
+		return fmt.Errorf("error reading logfile size: %w", err)
+	}
+
+	if siz < pos {
+		_, err := fops.seek(f, siz, io.SeekStart)
+		return fmt.Errorf("error setting logfile position: %w", err)
+	}
+
+	return nil
+}
+
+//FIXME: guard in a build tag
+func isAppend(f *os.File) (bool, error) {
+	flags, _, errno := syscall.Syscall(syscall.SYS_FCNTL, f.Fd(), uintptr(syscall.F_GETFL), 0)
+	if errno != 0 {
+		return false, errno
+	}
+	return (flags&uintptr(os.O_APPEND) != 0), nil
 }
