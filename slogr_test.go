@@ -120,15 +120,6 @@ func TestRunSlogTestsOnSlogHandlerLogSink(t *testing.T) {
 	exceptions := []string{
 		// logr sinks handle time themselves
 		"a Handler should ignore a zero Record.Time",
-		// slogHandler does not do groups "properly", so these all fail with
-		// "missing group".  It's looking for `"G":{"a":"b"}` and getting
-		// `"G.a": "b"`.
-		"a Handler should handle Group attributes",
-		"a Handler should handle the WithGroup method",
-		"a Handler should handle multiple WithGroup and WithAttr calls",
-		"a Handler should not output groups for an empty Record",
-		"a Handler should call Resolve on attribute values in groups",
-		"a Handler should call Resolve on attribute values in groups from WithAttrs",
 	}
 	testhelp.RunSlogTests(t, func(buffer *bytes.Buffer) slog.Handler {
 		// We want a known-good Logger that emits JSON but is not a slogHandler

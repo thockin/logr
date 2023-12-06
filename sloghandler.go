@@ -30,9 +30,14 @@ type slogHandler struct {
 	// Non-nil if sink is non-nil and implements SlogSink.
 	slogSink SlogSink
 
-	// groupPrefix collects values from WithGroup calls. It gets added as
-	// prefix to value keys when handling a log record.
-	groupPrefix string
+	// groupName is the name of the current group.
+	groupName string
+
+	// these keep track of the current set of values, the direct parent of this
+	// set, and the root of the tree.
+	currentValues []any
+	parentValues  map[string]any
+	rootValues    map[string]any
 
 	// levelBias can be set when constructing the handler to influence the
 	// slog.Level of log records. A positive levelBias reduces the
@@ -43,9 +48,6 @@ type slogHandler struct {
 }
 
 var _ slog.Handler = &slogHandler{}
-
-// groupSeparator is used to concatenate WithGroup names and attribute keys.
-const groupSeparator = "."
 
 // GetLevel is used for black box unit testing.
 func (l *slogHandler) GetLevel() slog.Level {
@@ -68,11 +70,26 @@ func (l *slogHandler) Handle(ctx context.Context, record slog.Record) error {
 	// No need to check for nil sink here because Handle will only be called
 	// when Enabled returned true.
 
-	kvList := make([]any, 0, 2*record.NumAttrs())
-	record.Attrs(func(attr slog.Attr) bool {
-		kvList = attrToKVs(attr, l.groupPrefix, kvList)
-		return true
-	})
+	var kvList []any
+
+	// Collect all the values for this group.
+	if n := len(l.currentValues) + record.NumAttrs(); n > 0 {
+		kvList = make([]any, 0, 2*n)
+		kvList = append(kvList, l.currentValues...)
+		record.Attrs(func(attr slog.Attr) bool {
+			kvList = attrToKVs(attr, kvList)
+			return true
+		})
+		if l.parentValues != nil {
+			l.parentValues[l.groupName] = listToMap(kvList)
+		}
+	}
+
+	// If this is under group, start at the root of the group structure.
+	if l.parentValues != nil {
+		kvList = mapToList(l.rootValues)
+	}
+
 	if record.Level >= slog.LevelError {
 		l.sinkWithCallDepth().Error(nil, record.Message, kvList...)
 	} else {
@@ -109,13 +126,16 @@ func (l *slogHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
 	if l.slogSink != nil {
 		clone.slogSink = l.slogSink.WithAttrs(attrs)
 		clone.sink = clone.slogSink
-	} else {
-		kvList := make([]any, 0, 2*len(attrs))
-		for _, attr := range attrs {
-			kvList = attrToKVs(attr, l.groupPrefix, kvList)
-		}
-		clone.sink = l.sink.WithValues(kvList...)
+		return &clone
 	}
+
+	kvList := make([]any, 0, 2*len(attrs))
+	for _, attr := range attrs {
+		kvList = attrToKVs(attr, kvList)
+	}
+	n := len(clone.currentValues)
+	clone.currentValues = append(clone.currentValues[:n:n], kvList...) // copy on write
+
 	return &clone
 }
 
@@ -123,50 +143,79 @@ func (l *slogHandler) WithGroup(name string) slog.Handler {
 	if l.sink == nil {
 		return l
 	}
-	if name == "" {
-		// slog says to inline empty groups
-		return l
-	}
+
 	clone := *l
 	if l.slogSink != nil {
 		clone.slogSink = l.slogSink.WithGroup(name)
 		clone.sink = clone.slogSink
-	} else {
-		clone.groupPrefix = addPrefix(clone.groupPrefix, name)
+		return &clone
 	}
+
+	// If the group name is empty, values are inlined.
+	if name == "" {
+		return &clone
+	}
+
+	// The first time we get a group with a non-empty name, we initialize
+	// the tree of maps.  This means that all of the group fields are set or
+	// unset together.
+
+	currentMap := listToMap(clone.currentValues)
+	if clone.groupName == "" {
+		// We don't have a root yet, so the current values are it.
+		clone.rootValues = currentMap
+	} else {
+		// The current values become a member of the parent.
+		//FIXME: shared value, need a deep copy?
+		clone.parentValues[clone.groupName] = currentMap
+	}
+	clone.parentValues = currentMap
+	clone.currentValues = nil
+	clone.groupName = name
+
 	return &clone
 }
 
 // attrToKVs appends a slog.Attr to a logr-style kvList.  It handle slog Groups
 // and other details of slog.
-func attrToKVs(attr slog.Attr, groupPrefix string, kvList []any) []any {
+func attrToKVs(attr slog.Attr, kvList []any) []any {
 	attrVal := attr.Value.Resolve()
 	if attrVal.Kind() == slog.KindGroup {
 		groupVal := attrVal.Group()
 		grpKVs := make([]any, 0, 2*len(groupVal))
-		prefix := groupPrefix
-		if attr.Key != "" {
-			prefix = addPrefix(groupPrefix, attr.Key)
-		}
 		for _, attr := range groupVal {
-			grpKVs = attrToKVs(attr, prefix, grpKVs)
+			grpKVs = attrToKVs(attr, grpKVs)
 		}
-		kvList = append(kvList, grpKVs...)
+		if attr.Key == "" {
+			// slog says we have to inline these.
+			kvList = append(kvList, grpKVs...)
+		} else {
+			// Convert the list into a map for rendering.
+			kvList = append(kvList, attr.Key, listToMap(grpKVs))
+		}
 	} else if attr.Key != "" {
-		kvList = append(kvList, addPrefix(groupPrefix, attr.Key), attrVal.Any())
+		kvList = append(kvList, attr.Key, attrVal.Any())
 	}
 
 	return kvList
 }
 
-func addPrefix(prefix, name string) string {
-	if prefix == "" {
-		return name
+func listToMap(kvList []any) map[string]any {
+	kvMap := map[string]any{}
+	for i := 0; i < len(kvList); i += 2 {
+		k := kvList[i].(string) //nolint:forcetypeassert
+		v := kvList[i+1]
+		kvMap[k] = v
 	}
-	if name == "" {
-		return prefix
+	return kvMap
+}
+
+func mapToList(kvMap map[string]any) []any {
+	kvList := make([]any, 0, 2*len(kvMap))
+	for k, v := range kvMap {
+		kvList = append(kvList, k, v)
 	}
-	return prefix + groupSeparator + name
+	return kvList
 }
 
 // levelFromSlog adjusts the level by the logger's verbosity and negates it.
